@@ -1,0 +1,1 @@
+Read X/Reddit login cookies from Vivaldi on Linux: `v10` values decrypt with Chromium's fixed Linux key and `v11` values with the Safe Storage password from KWallet (`kwallet-query`) or the Secret Service keyring (`secret-tool`). `FROM_BROWSER=auto` on Linux now tries Firefox, then Vivaldi.

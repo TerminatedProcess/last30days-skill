@@ -18,7 +18,7 @@ import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .cookie_paths import path_exists, path_is_dir
 from .sqlite_snapshot import copy_snapshot
@@ -53,6 +53,23 @@ CHROMIUM_BROWSER_PROFILES: dict[str, tuple[Path, str]] = {
     "dia": (_APP_SUPPORT / "Dia" / "User Data", "Dia Safe Storage"),
     "chromium": (_APP_SUPPORT / "Chromium", "Chromium Safe Storage"),
 }
+
+# Linux Chromium-family browsers, keyed by FROM_BROWSER name. Each maps to
+# (profile base directory, KWallet (folder, entry) pairs, libsecret
+# ``application`` attribute values). Vivaldi stores its key under Chrome's
+# names ("Chrome Keys" / "Chrome Safe Storage"), not its own.
+_XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+LINUX_CHROMIUM_BROWSERS: dict[str, tuple[Path, tuple[tuple[str, str], ...], tuple[str, ...]]] = {
+    "vivaldi": (
+        _XDG_CONFIG / "vivaldi",
+        (("Chrome Keys", "Chrome Safe Storage"), ("Vivaldi Keys", "Vivaldi Safe Storage")),
+        ("chrome", "vivaldi"),
+    ),
+}
+# Linux: v10 values use the fixed password "peanuts"; v11 values use the
+# keyring password. Both derive with a single PBKDF2 iteration.
+LINUX_V10_PASSWORD = b"peanuts"
+LINUX_PBKDF2_ITERATIONS = 1
 
 # Chromium v10 encryption constants (shared by Chrome and Brave)
 CHROME_SALT = b"saltysalt"
@@ -100,15 +117,106 @@ def _get_chrome_encryption_key() -> Optional[bytes]:
     return _get_chromium_encryption_key("Chrome Safe Storage")
 
 
-def _derive_aes_key(passphrase: bytes) -> bytes:
-    """Derive 16-byte AES key from Chrome's Keychain passphrase via PBKDF2."""
+def _derive_aes_key(passphrase: bytes, iterations: int = CHROME_PBKDF2_ITERATIONS) -> bytes:
+    """Derive 16-byte AES key from a Chromium Safe Storage passphrase via PBKDF2."""
     return hashlib.pbkdf2_hmac(
         "sha1",
         passphrase,
         CHROME_SALT,
-        CHROME_PBKDF2_ITERATIONS,
+        iterations,
         dklen=CHROME_KEY_LENGTH,
     )
+
+
+def _run_secret_cli(args: list[str], timeout: int = 30) -> Optional[str]:
+    """Run a keyring CLI and return its stripped stdout, or None on any failure."""
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("%s unavailable: %s", args[0], exc)
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _kwallet_name() -> str:
+    """The default KWallet name from kwalletrc, else ``kdewallet``."""
+    try:
+        for line in (_XDG_CONFIG / "kwalletrc").read_text().splitlines():
+            if line.startswith("Default Wallet="):
+                return line.split("=", 1)[1].strip() or "kdewallet"
+    except OSError:
+        pass
+    return "kdewallet"
+
+
+def _get_linux_keyring_passwords(
+    kwallet_entries: tuple[tuple[str, str], ...], libsecret_apps: tuple[str, ...]
+) -> list[bytes]:
+    """Read every candidate Chromium Safe Storage password from KWallet or libsecret.
+
+    Tries ``kwallet-query`` (KDE) for each (folder, entry), then
+    ``secret-tool`` (GNOME keyring / any Secret Service) for each application.
+    All found passwords are returned in that order, because an entry under a
+    shared name (e.g. Chrome's) may belong to a different browser; the caller
+    keeps the one that actually decrypts. Either tool may show an unlock dialog
+    when the wallet is locked.
+    """
+    found: list[bytes] = []
+    wallet = _kwallet_name()
+    for folder, entry in kwallet_entries:
+        value = _run_secret_cli(["kwallet-query", "-r", entry, "-f", folder, wallet])
+        # kwallet-query exits non-zero when absent; guard older notice-on-stdout builds.
+        if value and "does not exist" not in value and "failed to read" not in value.lower():
+            found.append(value.encode("utf-8"))
+    for app in libsecret_apps:
+        value = _run_secret_cli(["secret-tool", "lookup", "application", app])
+        if value:
+            found.append(value.encode("utf-8"))
+    if not found:
+        logger.info("No Chromium Safe Storage password found in KWallet or libsecret")
+    return list(dict.fromkeys(found))
+
+
+def _linux_key_resolver(
+    kwallet_entries: tuple[tuple[str, str], ...], libsecret_apps: tuple[str, ...]
+) -> Callable[[bytes], list[bytes]]:
+    """Return a prefix -> candidate AES keys function; the keyring is read once."""
+    cache: dict[bytes, list[bytes]] = {}
+
+    def resolve(prefix: bytes) -> list[bytes]:
+        if prefix not in cache:
+            if prefix == b"v10":
+                cache[prefix] = [_derive_aes_key(LINUX_V10_PASSWORD, LINUX_PBKDF2_ITERATIONS)]
+            elif prefix == b"v11":
+                cache[prefix] = [
+                    _derive_aes_key(pw, LINUX_PBKDF2_ITERATIONS)
+                    for pw in _get_linux_keyring_passwords(kwallet_entries, libsecret_apps)
+                ]
+            else:
+                cache[prefix] = []
+        return cache[prefix]
+
+    return resolve
+
+
+def _decrypt_with_candidates(
+    encrypted_value: bytes, keys: list[bytes], db_version: int
+) -> Optional[str]:
+    """Decrypt with the first key that yields clean UTF-8, moving it to the front.
+
+    A wrong key almost always fails the PKCS7 check; on the rare valid-looking
+    padding the output still decodes to replacement characters, so it is skipped.
+    """
+    for i, key in enumerate(keys):
+        decrypted = _decrypt_v10_value(encrypted_value, key, db_version)
+        if decrypted and "\ufffd" not in decrypted:
+            if i:
+                keys.insert(0, keys.pop(i))
+            return decrypted
+    return None
 
 
 def _decrypt_v10_value(encrypted_value: bytes, aes_key: bytes, db_version: int) -> Optional[str]:
@@ -208,8 +316,12 @@ def _extract_chromium_cookies_macos(
     domain: str,
     cookie_names: list[str],
     key_cache: Optional[dict[str, Optional[bytes]]] = None,
+    key_for_prefix: Optional[Callable[[bytes], list[bytes]]] = None,
 ) -> Optional[dict[str, str]]:
     """Extract cookies from any Chromium-based browser on macOS.
+
+    With ``key_for_prefix`` (Linux), the encryption prefix (``v10``/``v11``)
+    selects candidate AES keys through that callable instead of the macOS Keychain.
 
     Snapshots committed Cookies database state to a temp file, reads specified cookies,
     and decrypts v10-encrypted values using the Keychain-stored key.
@@ -283,7 +395,17 @@ def _extract_chromium_cookies_macos(
                 results[name] = value
                 continue
 
-            if encrypted_value and encrypted_value[:3] == b"v10":
+            if key_for_prefix is not None and encrypted_value and encrypted_value[:3] in (b"v10", b"v11"):
+                linux_keys = key_for_prefix(encrypted_value[:3])
+                if not linux_keys:
+                    logger.debug("Skipping encrypted cookie %s — no keyring key", name)
+                    continue
+                decrypted = _decrypt_with_candidates(encrypted_value, linux_keys, db_version)
+                if decrypted:
+                    results[name] = decrypted
+                else:
+                    logger.debug("Failed to decrypt cookie %s", name)
+            elif encrypted_value and encrypted_value[:3] == b"v10":
                 if not key_fetched:
                     # Fetch the Keychain key lazily — only once we actually have
                     # an encrypted cookie to decrypt. This avoids a macOS
@@ -435,7 +557,11 @@ def _find_all_chromium_cookies_dbs(
 
 
 def _extract_chromium_cookies_any_profile(
-    base_dir: Path, keychain_service: str, domain: str, cookie_names: list[str]
+    base_dir: Path,
+    keychain_service: str,
+    domain: str,
+    cookie_names: list[str],
+    key_for_prefix: Optional[Callable[[bytes], list[bytes]]] = None,
 ) -> Optional[dict[str, str]]:
     """Try every profile under base_dir and return the best cookie match.
 
@@ -456,7 +582,8 @@ def _extract_chromium_cookies_any_profile(
     for db_path in db_paths:
         try:
             got = _extract_chromium_cookies_macos(
-                db_path, keychain_service, domain, cookie_names, key_cache=key_cache
+                db_path, keychain_service, domain, cookie_names,
+                key_cache=key_cache, key_for_prefix=key_for_prefix,
             )
         except PermissionError as exc:
             denials.append(exc)
@@ -504,4 +631,24 @@ def extract_chromium_browser_cookies_macos(
     base_dir, keychain_service = spec
     return _extract_chromium_cookies_any_profile(
         base_dir, keychain_service, domain, cookie_names
+    )
+
+
+def extract_chromium_browser_cookies_linux(
+    browser: str, domain: str, cookie_names: list[str]
+) -> Optional[dict[str, str]]:
+    """Extract cookies from a registry-defined Chromium browser on Linux.
+
+    Covers LINUX_CHROMIUM_BROWSERS (Vivaldi). ``v10`` values decrypt with the
+    fixed Linux password; ``v11`` values need the Safe Storage password from
+    KWallet or libsecret. The keyring is read only when a ``v11`` cookie matches.
+    """
+    spec = LINUX_CHROMIUM_BROWSERS.get(browser)
+    if spec is None:
+        logger.debug("Chromium browser %s not supported on Linux", browser)
+        return None
+    base_dir, kwallet_entries, libsecret_apps = spec
+    return _extract_chromium_cookies_any_profile(
+        base_dir, f"{browser} (Linux)", domain, cookie_names,
+        key_for_prefix=_linux_key_resolver(kwallet_entries, libsecret_apps),
     )
